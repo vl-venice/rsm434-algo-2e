@@ -9,16 +9,21 @@ of commentary in one file:
   * Inline comments explain the Python itself, line by line.
 
 How to run
-  1. Install the requests package, once:     pip install requests
-  2. Fill in your trader ID and password under "settings" below.
-  3. While the ALGO2e practice case is running, run this file -- in VS Code,
+  1. Fill in your trader ID and password under "settings" below.
+  2. While the ALGO2e practice case is running, run this file -- in VS Code,
      Run > Run Without Debugging; or in a terminal:
          python "RSM434 ALGO2e Primer - DMA.py"
-  4. It trades until the case stops. Press Ctrl+C to stop it early.
+  3. It trades until the case stops. Press Ctrl+C to stop it early.
 
-The strategy widens quotes when prices move quickly, skews them against
-inventory, sizes them to visible depth and maker economics, and checks the
-case's gross and net share limits across all three securities.
+No extra packages are required: the HTTP calls use Python's built-in
+http.client, so this runs on macOS without installing requests or urllib3.
+
+The strategy posts passive quotes where the spread plus the maker rebate
+clears one tick of adverse selection, improves inside wide spreads, and
+keeps a resting order when the quote has not changed. CNR and AC can be
+quoted on a one-tick market; RY charges a maker fee, so it is quoted only
+when the spread is wide enough to pay for that. Inventory is skewed and
+capped per name, and the last 30 seconds are used to flatten.
 """
 
 # ---------------------------------------------------------------------------
@@ -43,26 +48,78 @@ case's gross and net share limits across all three securities.
 # ---------------------------------------------------------------------------
 
 import base64
+import json                # JSON turns RIT's text replies into Python dictionaries
+from http.client import HTTPConnection, HTTPException  # built-in HTTP; no requests / urllib3 needed
 from math import ceil
 from time import monotonic, sleep  # SLEEP pauses the program for a number of seconds
-
-import requests            # REQUESTS sends the HTTP messages RIT listens for
+from urllib.parse import urlencode, urlparse
 
 # ---------------------------------------------------------------- settings
 # The ALGO2e practice case on flserver. DMA talks to the RIT server directly,
 # so the RIT Client does not need to be running. Fill in your own trader ID
 # and password.
-BASE_URL = 'http://flserver.rotman.utoronto.ca:16655/v1'
-USERNAME = 'studentid'
-PASSWORD = 'pass'
+BASE_URL = 'http://flserver.rotman.utoronto.ca:16625/v1'
+USERNAME = '1010305634'
+PASSWORD = 'zh'
 
 # ---------------------------------------------------------------- connection
-# Session() keeps one connection open for every message. Without it Python
+# Session keeps one connection open for every message. Without it Python
 # would open and close a socket for each request, which causes errors when the
 # next request starts before the last connection has finished closing.
 # DMA signs in with HTTP Basic authentication: "Basic " + base64("id:password")
 credentials = base64.b64encode(f'{USERNAME}:{PASSWORD}'.encode()).decode()
-s = requests.Session()
+
+
+class Response:
+    """A reply from RIT. .ok, .status_code, .headers, .text and .json() are
+    the names the rest of this file uses to read that reply."""
+
+    def __init__(self, status, headers, body):
+        self.status_code = status
+        self.headers = headers
+        self.text = body.decode()
+
+    @property
+    def ok(self):
+        return 200 <= self.status_code < 400
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class Session:
+    """One reusable HTTP connection to the RIT server."""
+
+    def __init__(self):
+        parsed = urlparse(BASE_URL)
+        self._host = parsed.hostname
+        self._port = parsed.port
+        self.headers = {}
+        self._conn = None
+
+    def _connect(self, timeout):
+        self._conn = HTTPConnection(self._host, self._port, timeout=timeout)
+
+    def request(self, method, url, params=None, timeout=30):
+        path = urlparse(url).path
+        if params:
+            path = f'{path}?{urlencode(params)}'
+        if self._conn is None:
+            self._connect(timeout)
+        try:
+            self._conn.request(method, path, headers=self.headers)
+            http_resp = self._conn.getresponse()
+            body = http_resp.read()      # must read before the next request
+        except (OSError, HTTPException):
+            # The server closed the idle connection; open a new one and retry.
+            self._connect(timeout)
+            self._conn.request(method, path, headers=self.headers)
+            http_resp = self._conn.getresponse()
+            body = http_resp.read()
+        return Response(http_resp.status, http_resp.headers, body)
+
+
+s = Session()
 s.headers.update({'Authorization': 'Basic ' + credentials})
 
 
@@ -93,23 +150,30 @@ def api(s, method, path, params=None):
             return resp
         try:
             wait = float(resp.headers.get('Retry-After') or resp.json()['wait'])
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             wait = 0.1                  # no wait time given: pause briefly
         sleep(max(0.05, wait))
 
 
 # ---------------------------------------------------------------- settings
 # The brief caps each order at 5,000 shares and gross/net positions at 25,000.
-# The passive trade fee is a rebate when positive and a fee when negative.
+# A positive passive number is a maker rebate. RY's is negative: providing
+# liquidity there costs money, and taking liquidity there is paid.
 TICKERS = ('CNR', 'RY', 'AC')
 MAX_ORDER_SIZE = 5_000
 MAX_GROSS_POSITION = 25_000
 MAX_NET_POSITION = 25_000
+# Soft cap per name so one stock cannot use the whole gross limit.
+PER_NAME_LIMIT = 8_000
+# Above this, inventory risk is large enough to pay the taker fee and cross.
+HARD_INVENTORY = 15_000
 PASSIVE_REBATE = {'CNR': 0.0023, 'RY': -0.0020, 'AC': 0.0011}
+ACTIVE_FEE = {'CNR': 0.0027, 'RY': -0.0014, 'AC': 0.0015}
 PRICE_TICK = 0.01
-MAX_VOLATILITY_BUFFER_TICKS = 3
-# Add one protective tick for each 250 ms of observed API latency.
-LATENCY_BUFFER_SECONDS_PER_TICK = 0.25
+# A resting round trip must still pay after a one-tick adverse move.
+ADVERSE_SELECTION = PRICE_TICK
+CASE_LENGTH = 300
+FLATTEN_TICK = CASE_LENGTH - 30
 REQUEST_TIMEOUT_SECONDS = 3
 API_LATENCIES = {}
 
@@ -131,9 +195,9 @@ def get_tick():
 
 
 def get_order_book(ticker):
-    # WHAT IT IS FOR: reads the best prices and displayed size. Order size is
-    # based on this depth, so it responds to the liquidity currently available.
-    payload = {'ticker': ticker}      # a dictionary: the key 'ticker' with the value passed in
+    # WHAT IT IS FOR: reads the best prices and displayed size. An empty book
+    # returns no quote for this pass instead of stopping the whole algo.
+    payload = {'ticker': ticker}
     resp = api(s, 'GET', 'securities/book', payload)
     if not resp.ok:
         raise RuntimeError(
@@ -143,10 +207,10 @@ def get_order_book(ticker):
     book = resp.json()
     # The DMA Swagger uses singular names; the course's REST example uses the
     # plural names. Accept either documented response shape.
-    bids = book.get('bid', book.get('bids'))
-    asks = book.get('ask', book.get('asks'))
+    bids = book.get('bid', book.get('bids')) or []
+    asks = book.get('ask', book.get('asks')) or []
     if not bids or not asks:
-        raise RuntimeError(f'{ticker} order book is missing a bid or ask.')
+        return None, None
     return bids[0], asks[0]
 
 
@@ -207,79 +271,6 @@ def projected_gross(positions, open_orders, ticker, action, quantity):
     return gross
 
 
-def calculate_order_quantity(
-    ticker, action, level, spread, positions, open_orders, volatility_ticks=0
-):
-    # WHAT IT IS FOR: size orders to both the market and our remaining risk
-    # capacity. The visible queue sets the starting size; poor economics or
-    # limited portfolio headroom reduce it further.
-    if spread <= 0:
-        return 0
-
-    round_trip_edge = spread + 2 * PASSIVE_REBATE[ticker]
-    if round_trip_edge <= 0:
-        return 0
-
-    edge_fraction = min(1.0, round_trip_edge / spread)
-    position = positions[ticker]
-    adds_to_inventory = (
-        action == 'BUY' and position >= 0
-    ) or (
-        action == 'SELL' and position <= 0
-    )
-    inventory_fraction = min(1.0, abs(position) / MAX_NET_POSITION)
-    inventory_factor = (
-        max(0.2, 1.0 - 0.8 * inventory_fraction)
-        if adds_to_inventory else 1.0
-    )
-    volatility_factor = 1.0 / (1.0 + 0.5 * volatility_ticks)
-    quantity = min(
-        MAX_ORDER_SIZE,
-        int(
-            level['quantity']
-            * edge_fraction
-            * inventory_factor
-            * volatility_factor
-        ),
-    )
-    if level['quantity'] > 0 and quantity == 0:
-        quantity = 1
-    if quantity == 0:
-        return 0
-
-    pending_buys = sum(
-        remaining_quantity(order) for order in open_orders
-        if order['action'] == 'BUY'
-    )
-    pending_sells = sum(
-        remaining_quantity(order) for order in open_orders
-        if order['action'] == 'SELL'
-    )
-    net_low = sum(positions.values()) - pending_sells
-    net_high = sum(positions.values()) + pending_buys
-    if action == 'BUY':
-        quantity = min(quantity, MAX_NET_POSITION - net_high)
-    else:
-        quantity = min(quantity, MAX_NET_POSITION + net_low)
-    quantity = max(0, quantity)
-
-    if quantity == 0 or projected_gross(
-        positions, open_orders, ticker, action, 0
-    ) > MAX_GROSS_POSITION:
-        return 0
-
-    low, high = 0, quantity
-    while low < high:
-        candidate = (low + high + 1) // 2
-        if projected_gross(
-            positions, open_orders, ticker, action, candidate
-        ) <= MAX_GROSS_POSITION:
-            low = candidate
-        else:
-            high = candidate - 1
-    return low
-
-
 def observe_mid(ticker, bid, ask, previous_mids):
     """Track the last mid for this ticker and return its recent move."""
     mid = (float(bid['price']) + float(ask['price'])) / 2
@@ -288,32 +279,133 @@ def observe_mid(ticker, bid, ask, previous_mids):
     return mid, 0.0 if previous_mid is None else mid - previous_mid
 
 
-def calculate_quote_prices(
-    bid, ask, position, recent_mid_change, request_latency=0.0
-):
-    """Widen quotes when prices move quickly and skew them to reduce inventory."""
-    best_bid = float(bid['price'])
-    best_ask = float(ask['price'])
-    if best_ask <= best_bid:
+def to_ticks(price):
+    return int(round(float(price) / PRICE_TICK))
+
+
+def from_ticks(ticks):
+    return round(ticks * PRICE_TICK, 2)
+
+
+def minimum_spread_ticks(ticker):
+    # WHAT IT IS FOR: the tightest round trip that still pays after one tick
+    # of adverse selection. CNR and AC clear this on a one-tick market because
+    # their maker rebates help. RY charges 0.0020 per side to make a market,
+    # so it needs a two-tick spread before a quote is worth resting.
+    needed = ADVERSE_SELECTION - 2 * PASSIVE_REBATE[ticker]
+    return max(1, ceil(needed / PRICE_TICK - 1e-9))
+
+
+def market_edge(ticker, bid, ask):
+    spread = float(ask['price']) - float(bid['price'])
+    return spread + 2 * PASSIVE_REBATE[ticker]
+
+
+def limit_quantity(positions, open_orders, ticker, action, quantity):
+    # WHAT IT IS FOR: shrink a desired size until both the gross and the net
+    # limit still hold after this order and every order already resting.
+    if quantity <= 0:
+        return 0
+    quantity = min(quantity, MAX_ORDER_SIZE)
+
+    pending_buys = sum(
+        remaining_quantity(order) for order in open_orders
+        if order['action'] == 'BUY' and order['ticker'] in TICKERS
+    )
+    pending_sells = sum(
+        remaining_quantity(order) for order in open_orders
+        if order['action'] == 'SELL' and order['ticker'] in TICKERS
+    )
+    net_low = sum(positions.values()) - pending_sells
+    net_high = sum(positions.values()) + pending_buys
+    if action == 'BUY':
+        quantity = min(quantity, MAX_NET_POSITION - net_high)
+    else:
+        quantity = min(quantity, MAX_NET_POSITION + net_low)
+    if quantity <= 0:
+        return 0
+
+    low, high = 0, quantity
+    while low < high:
+        candidate = (low + high + 1) // 2
+        gross = projected_gross(
+            positions, open_orders, ticker, action, candidate
+        )
+        net = net_high + candidate if action == 'BUY' else net_low - candidate
+        if gross <= MAX_GROSS_POSITION and abs(net) <= MAX_NET_POSITION:
+            low = candidate
+        else:
+            high = candidate - 1
+    return low
+
+
+def desired_passive_quantity(ticker, action, position, edge):
+    # Scale size with how much the spread pays, and stop adding once this
+    # name is already at its inventory budget. The reducing side stays up
+    # so an existing position can be worked out at the rebate.
+    adds = (action == 'BUY' and position >= 0) or (action == 'SELL' and position <= 0)
+    if adds and abs(position) >= PER_NAME_LIMIT:
+        return 0
+    if edge <= ADVERSE_SELECTION and adds:
+        return 0
+
+    scale = min(1.0, max(0.0, (max(edge, 0.0) - ADVERSE_SELECTION) / 0.03))
+    quantity = int(1_500 + scale * (MAX_ORDER_SIZE - 1_500))
+    if adds:
+        room = PER_NAME_LIMIT - abs(position)
+        held_fraction = min(1.0, abs(position) / PER_NAME_LIMIT)
+        quantity = int(quantity * (1.0 - 0.75 * held_fraction))
+        quantity = min(quantity, room)
+    else:
+        quantity = max(quantity, min(abs(position), MAX_ORDER_SIZE))
+    return max(0, min(MAX_ORDER_SIZE, quantity))
+
+
+def quote_prices(ticker, bid, ask, position, recent_mid_change, latency):
+    """Choose passive bid and ask prices for one security.
+
+    Wide markets are joined one tick inside, which is where this case's
+    variable spreads actually pay. A fast move backs off only the side that
+    just became toxic. Inventory shifts both quotes toward flattening.
+    """
+    bid_tick = to_ticks(bid['price'])
+    ask_tick = to_ticks(ask['price'])
+    spread_ticks = ask_tick - bid_tick
+    if spread_ticks <= 0:
         return None
 
-    movement_ticks = ceil(abs(recent_mid_change) / PRICE_TICK)
-    latency_ticks = ceil(request_latency / LATENCY_BUFFER_SECONDS_PER_TICK)
-    volatility_ticks = min(
-        MAX_VOLATILITY_BUFFER_TICKS, max(movement_ticks, latency_ticks)
-    )
-    spread_ticks = max(1, round((best_ask - best_bid) / PRICE_TICK))
-    inventory_shift = round(
-        (position / MAX_NET_POSITION) * max(1, spread_ticks // 2)
-    )
-    trend_shift = round(recent_mid_change / (2 * PRICE_TICK))
-    center_shift = trend_shift - inventory_shift
+    min_ticks = minimum_spread_ticks(ticker)
+    improve = min(1, max(0, (spread_ticks - min_ticks) // 2))
+    if latency > 0.4:
+        improve = 0
 
-    quote_bid = best_bid + (center_shift - volatility_ticks) * PRICE_TICK
-    quote_ask = best_ask + (center_shift + volatility_ticks) * PRICE_TICK
-    quote_bid = min(quote_bid, best_ask - PRICE_TICK)
-    quote_ask = max(quote_ask, best_bid + PRICE_TICK)
-    return round(quote_bid, 2), round(quote_ask, 2), volatility_ticks
+    quote_bid = bid_tick + improve
+    quote_ask = ask_tick - improve
+
+    shock = int(round(recent_mid_change / PRICE_TICK))
+    if shock >= 2:
+        quote_bid -= min(2, shock - 1)
+    elif shock <= -2:
+        quote_ask += min(2, -shock - 1)
+
+    skew = int(round(2 * position / PER_NAME_LIMIT))
+    skew = max(-3, min(3, skew))
+    quote_bid -= skew
+    quote_ask -= skew
+
+    # Stay on the passive side of the touch. Crossing would pay the active fee.
+    quote_bid = min(quote_bid, ask_tick - 1)
+    quote_ask = max(quote_ask, bid_tick + 1)
+    if quote_ask - quote_bid < min_ticks:
+        if position > 0:
+            quote_bid = min(quote_bid, quote_ask - min_ticks)
+        elif position < 0:
+            quote_ask = max(quote_ask, quote_bid + min_ticks)
+        else:
+            return None
+    if quote_ask <= quote_bid:
+        return None
+    return from_ticks(quote_bid), from_ticks(quote_ask)
 
 
 def cancel_orders(ticker):
@@ -323,6 +415,99 @@ def cancel_orders(ticker):
             f'Could not cancel {ticker} orders '
             f'(HTTP {resp.status_code}): {resp.text}'
         )
+
+
+def cancel_order(order):
+    # Cancel one resting order. DELETE is the per-order call; commands/cancel
+    # with ids is the fallback on servers that do not accept DELETE.
+    order_id = order['order_id']
+    resp = api(s, 'DELETE', f'orders/{order_id}')
+    if resp.ok:
+        return True
+    resp = api(s, 'POST', 'commands/cancel', {'ids': order_id})
+    if resp.ok:
+        return True
+    print(
+        f"Could not cancel order {order_id} "
+        f'(HTTP {resp.status_code}): {resp.text}'
+    )
+    return False
+
+
+def drop_order(open_orders, order):
+    order_id = order['order_id']
+    return [item for item in open_orders if item.get('order_id') != order_id]
+
+
+def quote_is_current(order, price, quantity):
+    # A small size change is not worth losing queue priority.
+    if abs(float(order['price']) - price) >= PRICE_TICK / 2:
+        return False
+    difference = abs(remaining_quantity(order) - quantity)
+    return difference < max(500, int(0.25 * quantity))
+
+
+def sync_side(open_orders, ticker, action, price, quantity, positions):
+    """Keep one resting order for this side, or cancel it when quantity is 0."""
+    resting = [
+        order for order in open_orders
+        if order.get('ticker') == ticker and order.get('action') == action
+    ]
+    if quantity <= 0:
+        for order in resting:
+            if cancel_order(order):
+                open_orders = drop_order(open_orders, order)
+        return open_orders
+
+    keeper = next(
+        (order for order in resting if quote_is_current(order, price, quantity)),
+        None,
+    )
+    for order in resting:
+        if order is not keeper and cancel_order(order):
+            open_orders = drop_order(open_orders, order)
+    if keeper is not None:
+        return open_orders
+
+    quantity = limit_quantity(positions, open_orders, ticker, action, quantity)
+    if quantity <= 0:
+        return open_orders
+
+    resp = api(s, 'POST', 'orders', {
+        'ticker': ticker,
+        'type': 'LIMIT',
+        'quantity': quantity,
+        'price': price,
+        'action': action,
+    })
+    if not resp.ok:
+        print(
+            f'Could not place {action} order for {ticker} '
+            f'(HTTP {resp.status_code}): {resp.text}'
+        )
+        return open_orders
+
+    order = resp.json()
+    filled = int(order.get('quantity_filled', 0))
+    positions[ticker] += filled if action == 'BUY' else -filled
+    if order.get('status') == 'OPEN' and remaining_quantity(order) > 0:
+        open_orders.append(order)
+    return open_orders
+
+
+def flatten_position(ticker, position, bid, ask, open_orders, positions):
+    # WHAT IT IS FOR: pay the active fee to get out when inventory is too
+    # large or the case is about to end. A passive quote may not fill in time,
+    # and an unhedged position is then just market risk.
+    if position == 0 or bid is None:
+        return open_orders
+    action = 'SELL' if position > 0 else 'BUY'
+    price = float(bid['price'] if action == 'SELL' else ask['price'])
+    quantity = min(MAX_ORDER_SIZE, abs(position))
+    # Crossing RY is partly paid for by its taker rebate. Crossing CNR or AC
+    # costs the active fee. Either way this path is only used to cut risk.
+    _ = ACTIVE_FEE[ticker]
+    return sync_side(open_orders, ticker, action, price, quantity, positions)
 
 
 def cancel_all_orders():
