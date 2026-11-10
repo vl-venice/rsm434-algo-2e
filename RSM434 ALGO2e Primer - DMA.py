@@ -417,10 +417,14 @@ def cancel_orders(ticker):
         )
 
 
+def order_id_of(order):
+    return order.get('order_id', order.get('id'))
+
+
 def cancel_order(order):
     # Cancel one resting order. DELETE is the per-order call; commands/cancel
     # with ids is the fallback on servers that do not accept DELETE.
-    order_id = order['order_id']
+    order_id = order_id_of(order)
     resp = api(s, 'DELETE', f'orders/{order_id}')
     if resp.ok:
         return True
@@ -435,8 +439,8 @@ def cancel_order(order):
 
 
 def drop_order(open_orders, order):
-    order_id = order['order_id']
-    return [item for item in open_orders if item.get('order_id') != order_id]
+    order_id = order_id_of(order)
+    return [item for item in open_orders if order_id_of(item) != order_id]
 
 
 def quote_is_current(order, price, quantity):
@@ -504,9 +508,9 @@ def flatten_position(ticker, position, bid, ask, open_orders, positions):
     action = 'SELL' if position > 0 else 'BUY'
     price = float(bid['price'] if action == 'SELL' else ask['price'])
     quantity = min(MAX_ORDER_SIZE, abs(position))
-    # Crossing RY is partly paid for by its taker rebate. Crossing CNR or AC
-    # costs the active fee. Either way this path is only used to cut risk.
-    _ = ACTIVE_FEE[ticker]
+    other = 'BUY' if action == 'SELL' else 'SELL'
+    # Drop the side that would add more inventory before crossing.
+    open_orders = sync_side(open_orders, ticker, other, 0, 0, positions)
     return sync_side(open_orders, ticker, action, price, quantity, positions)
 
 
@@ -521,9 +525,11 @@ def cancel_all_orders():
 
 # ---------------------------------------------------------------- algorithm
 def main():
-    # WHAT IT IS FOR: quote the profitable securities using current market
-    # conditions, fee economics, inventory, and portfolio risk capacity.
-    _, status = get_tick()
+    # WHAT IT IS FOR: each pass, rank the three stocks by how much their
+    # current spread pays after fees, quote the best ones passively, and
+    # only cross the market to cut inventory that has become too large or
+    # that will otherwise be left open at the 300-second close.
+    tick, status = get_tick()
     if status == 'ACTIVE':
         cancel_all_orders()
     previous_mids = {}
@@ -535,77 +541,94 @@ def main():
                 cancel_all_orders()
             was_active = False
             sleep(0.2)
-            _, status = get_tick()
+            tick, status = get_tick()
             continue
 
         was_active = True
+        positions = get_positions()
+        open_orders = get_open_orders()
+        books = {}
+        changes = {}
+        edges = {}
         for ticker_symbol in TICKERS:
-            _, status = get_tick()
-            if status != 'ACTIVE':
-                break
-
-            # Cancel this ticker's previous quotes before reading new conditions.
-            cancel_orders(ticker_symbol)
-            positions = get_positions()
-            open_orders = get_open_orders()
-            if any(order['ticker'] == ticker_symbol for order in open_orders):
-                continue
-
             bid, ask = get_order_book(ticker_symbol)
-            _, recent_mid_change = observe_mid(
+            books[ticker_symbol] = (bid, ask)
+            if bid is None:
+                edges[ticker_symbol] = -1
+                changes[ticker_symbol] = 0.0
+                continue
+            _, changes[ticker_symbol] = observe_mid(
                 ticker_symbol, bid, ask, previous_mids
             )
-            quotes = calculate_quote_prices(
+            edges[ticker_symbol] = market_edge(ticker_symbol, bid, ask)
+
+        # Quote the widest risk-adjusted market first so it gets the shared
+        # 25,000-share gross and net capacity before the others.
+        latency = API_LATENCIES.get('securities/book', 0.0)
+        endgame = tick is not None and tick >= FLATTEN_TICK
+        for ticker_symbol in sorted(TICKERS, key=lambda name: edges[name], reverse=True):
+            bid, ask = books[ticker_symbol]
+            position = positions[ticker_symbol]
+            if bid is None:
+                continue
+
+            must_flatten = endgame or abs(position) > HARD_INVENTORY
+            if must_flatten:
+                if position == 0:
+                    open_orders = sync_side(
+                        open_orders, ticker_symbol, 'BUY', 0, 0, positions
+                    )
+                    open_orders = sync_side(
+                        open_orders, ticker_symbol, 'SELL', 0, 0, positions
+                    )
+                    continue
+                if endgame:
+                    target_position = 0
+                else:
+                    target_position = PER_NAME_LIMIT if position > 0 else -PER_NAME_LIMIT
+                open_orders = flatten_position(
+                    ticker_symbol,
+                    position - target_position,
+                    bid,
+                    ask,
+                    open_orders,
+                    positions,
+                )
+                continue
+
+            quotes = quote_prices(
+                ticker_symbol,
                 bid,
                 ask,
-                positions[ticker_symbol],
-                recent_mid_change,
-                max(
-                    API_LATENCIES.get('securities/book', 0.0),
-                    API_LATENCIES.get('orders', 0.0),
-                ),
+                position,
+                changes[ticker_symbol],
+                latency,
             )
-            if quotes is None:
-                continue
-            bid_price, ask_price, volatility_ticks = quotes
-            spread = ask_price - bid_price
+            edge = edges[ticker_symbol]
+            if quotes is None and position > 0:
+                bid_price, ask_price = None, float(ask['price'])
+            elif quotes is None and position < 0:
+                bid_price, ask_price = float(bid['price']), None
+            elif quotes is None:
+                bid_price, ask_price = None, None
+            else:
+                bid_price, ask_price = quotes
 
-            for action, level, price in (
-                ('BUY', bid, bid_price),
-                ('SELL', ask, ask_price),
-            ):
-                quantity = calculate_order_quantity(
-                    ticker_symbol,
-                    action,
-                    level,
-                    spread,
-                    positions,
-                    open_orders,
-                    volatility_ticks,
-                )
-                if quantity == 0:
-                    continue
+            buy_qty = 0 if bid_price is None else desired_passive_quantity(
+                ticker_symbol, 'BUY', position, edge
+            )
+            sell_qty = 0 if ask_price is None else desired_passive_quantity(
+                ticker_symbol, 'SELL', position, edge
+            )
+            open_orders = sync_side(
+                open_orders, ticker_symbol, 'BUY', bid_price or 0, buy_qty, positions
+            )
+            open_orders = sync_side(
+                open_orders, ticker_symbol, 'SELL', ask_price or 0, sell_qty, positions
+            )
 
-                resp = api(s, 'POST', 'orders', {
-                    'ticker': ticker_symbol,
-                    'type': 'LIMIT',
-                    'quantity': quantity,
-                    'price': price,
-                    'action': action,
-                })
-                if not resp.ok:
-                    raise RuntimeError(
-                        f'Could not place {action} order for {ticker_symbol} '
-                        f'(HTTP {resp.status_code}): {resp.text}'
-                    )
-                order = resp.json()
-                filled = int(order.get('quantity_filled', 0))
-                positions[ticker_symbol] += filled if action == 'BUY' else -filled
-                if order.get('status') == 'OPEN' and remaining_quantity(order) > 0:
-                    open_orders.append(order)
-
-        if status == 'ACTIVE':
-            _, status = get_tick()
+        tick, status = get_tick()
+        sleep(0.05)
 
 
 if __name__ == '__main__':   # true when you run this file directly
